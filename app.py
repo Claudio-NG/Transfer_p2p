@@ -1,3 +1,14 @@
+# app.py — Transfer P2P (refactor com fila, cancelamento, ETA e UX melhorada)
+# Requisitos: Python 3.10+, PyQt6
+# Observações:
+# - Protocolo mantido (auth -> manifest -> chunk/ack -> done/finished).
+# - Fila de envios com UI (adicionar vários arquivos; iniciar; cancelar atual; limpar concluídos).
+# - ETA (tempo restante) + taxa média com janela móvel.
+# - Cancelamento imediato via asyncio.Event.
+# - Logs visíveis e estáveis; mensagens de sessão no receptor.
+# - Correção: uso de queue.Queue para comunicação entre threads.
+# - Opcional: hashing final do arquivo no receptor ao concluir (mostrado no log).
+
 import os
 import sys
 import ssl
@@ -8,12 +19,22 @@ import asyncio
 import hashlib
 import struct
 import uuid
+import queue
 import secrets
 import socket
 import threading
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox, QProgressBar, QMessageBox, QTabWidget, QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QPlainTextEdit, QGroupBox
-from PyQt6.QtCore import Qt, QTimer
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Dict, List, Tuple
+
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
+    QFileDialog, QSpinBox, QDoubleSpinBox, QProgressBar, QMessageBox, QTabWidget, QHBoxLayout,
+    QTableWidget, QTableWidgetItem, QHeaderView, QPlainTextEdit, QGroupBox
+)
+from PyQt6.QtCore import Qt, QTimer, QMimeData
 from PyQt6.QtGui import QPixmap
+
 try:
     import qrcode
 except:
@@ -38,9 +59,16 @@ async def send_msg(writer, header, payload=b""):
         writer.write(payload)
     await writer.drain()
 
-def sha256_bytes(b):
+def sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256()
     h.update(b)
+    return h.hexdigest()
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
     return h.hexdigest()
 
 def ceildiv(a, b):
@@ -56,6 +84,10 @@ def local_ip():
     finally:
         s.close()
     return ip
+
+# =========================
+#        SERVER CORE
+# =========================
 
 class TransferState:
     def __init__(self, path, file_size, chunk_size):
@@ -95,7 +127,7 @@ class ServerCore:
         self.out_dir = out_dir
         self.token = token
         self.ssl_ctx = ssl_ctx
-        self.sessions = {}
+        self.sessions: Dict[str, TransferState] = {}
         self.sessions_lock = asyncio.Lock()
         self.on_event = on_event
 
@@ -110,63 +142,71 @@ class ServerCore:
         try:
             auth = await read_header(reader)
             if auth.get("type") != "auth" or auth.get("token") != self.token:
-                await send_msg(writer, {"type":"error","reason":"auth"})
+                await send_msg(writer, {"type": "error", "reason": "auth"})
                 writer.close()
                 await writer.wait_closed()
                 return
+
             manifest = await read_header(reader)
             if manifest.get("type") != "manifest":
-                await send_msg(writer, {"type":"error","reason":"manifest"})
+                await send_msg(writer, {"type": "error", "reason": "manifest"})
                 writer.close()
                 await writer.wait_closed()
                 return
+
             sess = manifest["session"]
             name = manifest["filename"]
             fsize = manifest["filesize"]
             csize = manifest["chunksize"]
+
             async with self.sessions_lock:
                 st = self.sessions.get(sess)
                 if not st:
                     path = os.path.join(self.out_dir, name)
                     st = TransferState(path, fsize, csize)
                     self.sessions[sess] = st
-                    self.emit("session", {"session":sess,"filename":name,"total":st.total_chunks})
-            await send_msg(writer, {"type":"ready","session":sess,"chunks":st.total_chunks})
+                    self.emit("session", {"session": sess, "filename": name, "total": st.total_chunks})
+
+            await send_msg(writer, {"type": "ready", "session": sess, "chunks": st.total_chunks})
+
             while True:
                 h = await read_header(reader)
                 t = h.get("type")
                 if t == "chunk":
                     sess2 = h["session"]
                     if sess2 != sess:
-                        await send_msg(writer, {"type":"error","reason":"session"})
+                        await send_msg(writer, {"type": "error", "reason": "session"})
                         break
                     idx = h["index"]
                     size = h["size"]
                     hashexp = h["sha256"]
                     data = await read_exact(reader, size)
                     if sha256_bytes(data) != hashexp:
-                        await send_msg(writer, {"type":"nack","index":idx})
+                        await send_msg(writer, {"type": "nack", "index": idx})
                         continue
                     await st.write_chunk(idx, data)
-                    await send_msg(writer, {"type":"ack","index":idx})
-                    self.emit("progress", {"session":sess,"received":st.received,"total":st.total_chunks})
+                    await send_msg(writer, {"type": "ack", "index": idx})
+                    self.emit("progress", {"session": sess, "received": st.received, "total": st.total_chunks})
+
                 elif t == "done":
                     if st.done.is_set():
-                        await send_msg(writer, {"type":"finished","session":sess})
-                        self.emit("finished", {"session":sess})
+                        await send_msg(writer, {"type": "finished", "session": sess})
+                        self.emit("finished", {"session": sess})
                     else:
-                        await send_msg(writer, {"type":"pending","left":st.total_chunks - st.received})
+                        await send_msg(writer, {"type": "pending", "left": st.total_chunks - st.received})
                 else:
-                    await send_msg(writer, {"type":"error","reason":"type"})
+                    await send_msg(writer, {"type": "error", "reason": "type"})
+
                 if st.done.is_set():
-                    await send_msg(writer, {"type":"finished","session":sess})
-                    self.emit("finished", {"session":sess})
+                    await send_msg(writer, {"type": "finished", "session": sess})
+                    self.emit("finished", {"session": sess})
                     break
+
         except asyncio.IncompleteReadError:
             pass
         except Exception:
             try:
-                await send_msg(writer, {"type":"error","reason":"exception"})
+                await send_msg(writer, {"type": "error", "reason": "exception"})
             except:
                 pass
         finally:
@@ -178,7 +218,7 @@ class ServerCore:
 
 async def run_server(bind, port, server_inst, stop_event=None):
     srv = await asyncio.start_server(server_inst.handle, bind, port, ssl=server_inst.ssl_ctx)
-    server_inst.emit("listening", {"bind":bind,"port":port})
+    server_inst.emit("listening", {"bind": bind, "port": port})
     async with srv:
         if stop_event is None:
             await srv.serve_forever()
@@ -187,14 +227,22 @@ async def run_server(bind, port, server_inst, stop_event=None):
             srv.close()
             await srv.wait_closed()
 
-async def client_worker(host, port, token, manifest, q, retries, max_retries, on_progress, ssl_ctx=None):
+# =========================
+#        CLIENT CORE
+# =========================
+
+async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, max_retries,
+                        on_progress: Optional[Callable[[int, int], None]],
+                        ssl_ctx=None, cancel_event: Optional[asyncio.Event] = None):
     r, w = await asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None)
-    await send_msg(w, {"type":"auth","token":token})
-    await send_msg(w, {"type":"manifest", **manifest})
+    await send_msg(w, {"type": "auth", "token": token})
+    await send_msg(w, {"type": "manifest", **manifest})
     await read_header(r)
     f = open(manifest["filepath"], "rb")
     try:
         while True:
+            if cancel_event and cancel_event.is_set():
+                break
             try:
                 idx = q.get_nowait()
             except asyncio.QueueEmpty:
@@ -202,31 +250,41 @@ async def client_worker(host, port, token, manifest, q, retries, max_retries, on
             f.seek(idx * manifest["chunksize"])
             data = f.read(manifest["chunksize"])
             hashexp = sha256_bytes(data)
-            await send_msg(w, {"type":"chunk","session":manifest["session"],"index":idx,"size":len(data),"sha256":hashexp}, data)
+            await send_msg(w, {
+                "type": "chunk", "session": manifest["session"], "index": idx,
+                "size": len(data), "sha256": hashexp
+            }, data)
             try:
                 ack = await read_header(r)
             except asyncio.IncompleteReadError:
-                retries[idx] = retries.get(idx,0) + 1
-                if retries[idx] <= max_retries:
+                retries[idx] = retries.get(idx, 0) + 1
+                if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
                     await q.put(idx)
                 continue
+
             if ack.get("type") == "ack" and ack.get("index") == idx:
                 if on_progress:
                     on_progress(len(data), manifest["filesize"])
                 continue
+
             if ack.get("type") == "nack" and ack.get("index") == idx:
-                retries[idx] = retries.get(idx,0) + 1
-                if retries[idx] <= max_retries:
+                retries[idx] = retries.get(idx, 0) + 1
+                if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
                     await q.put(idx)
                 continue
-            retries[idx] = retries.get(idx,0) + 1
-            if retries[idx] <= max_retries:
+
+            # outro caso: re-enfileira com limite
+            retries[idx] = retries.get(idx, 0) + 1
+            if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
                 await q.put(idx)
-        await send_msg(w, {"type":"done"})
-        try:
-            await read_header(r)
-        except asyncio.IncompleteReadError:
-            pass
+
+        # Finalização
+        if not (cancel_event and cancel_event.is_set()):
+            await send_msg(w, {"type": "done"})
+            try:
+                await read_header(r)
+            except asyncio.IncompleteReadError:
+                pass
     finally:
         try:
             f.close()
@@ -238,26 +296,37 @@ async def client_worker(host, port, token, manifest, q, retries, max_retries, on
         except:
             pass
 
-async def client_send(host, port, token, file_path, chunk_mb, parallel, on_progress=None, tls_ca=None, max_retries=3):
+async def client_send(host, port, token, file_path, chunk_mb, parallel,
+                      on_progress=None, tls_ca=None, max_retries=3,
+                      cancel_event: Optional[asyncio.Event] = None):
     chunk_size = int(float(chunk_mb) * 1024 * 1024)
     filesize = os.path.getsize(file_path)
     total_chunks = ceildiv(filesize, chunk_size)
     name = os.path.basename(file_path)
     sess = str(uuid.uuid4())
-    manifest = {"type":"manifest","session":sess,"filename":name,"filepath":file_path,"filesize":filesize,"chunksize":chunk_size,"total":total_chunks}
+    manifest = {
+        "type": "manifest", "session": sess, "filename": name,
+        "filepath": file_path, "filesize": filesize, "chunksize": chunk_size, "total": total_chunks
+    }
     q = asyncio.Queue()
     for i in range(total_chunks):
         await q.put(i)
     ssl_ctx = None
     if tls_ca:
         ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=tls_ca)
+
     retries = {}
-    if parallel < 1:
-        parallel = 1
+    parallel = max(1, int(parallel))
     tasks = []
     for _ in range(parallel):
-        tasks.append(asyncio.create_task(client_worker(host, port, token, manifest, q, retries, max_retries, on_progress, ssl_ctx)))
+        tasks.append(asyncio.create_task(
+            client_worker(host, port, token, manifest, q, retries, max_retries, on_progress, ssl_ctx, cancel_event)
+        ))
     await asyncio.gather(*tasks)
+
+# =========================
+#      THREAD WRAPPERS
+# =========================
 
 class ServerThread(threading.Thread):
     def __init__(self, bind, port, out_dir, token, q):
@@ -266,7 +335,7 @@ class ServerThread(threading.Thread):
         self.port = port
         self.out_dir = out_dir
         self.token = token
-        self.q = q
+        self.q: queue.Queue = q
         self.loop = None
         self.stop_evt = None
 
@@ -286,57 +355,305 @@ class ServerThread(threading.Thread):
         if self.loop and self.stop_evt:
             self.loop.call_soon_threadsafe(self.stop_evt.set)
 
-class SenderTab(QWidget):
-    def __init__(self):
-        super().__init__()
+class _ServerThreadWrapper(threading.Thread):
+    """Mantido para compatibilidade com ReceiverTab; idêntico ao ServerThread mas com controles de UI."""
+    def __init__(self, bind, port, out_dir, token, q):
+        super().__init__(daemon=True)
+        self.bind = bind
+        self.port = port
+        self.out_dir = out_dir
+        self.token = token
+        self.q: queue.Queue = q
+        self.loop = None
+        self.stop_evt = None
+        self.rows = {}
+        self.table_rows = 0
+
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        def on_event(typ, data):
+            self.q.put(("event", typ, data))
+        srv = ServerCore(self.out_dir, self.token, None, on_event)
+        self.stop_evt = asyncio.Event()
+        try:
+            self.loop.run_until_complete(run_server(self.bind, self.port, srv, self.stop_evt))
+        finally:
+            pass
+
+    def stop(self):
+        if self.loop and self.stop_evt:
+            self.loop.call_soon_threadsafe(self.stop_evt.set)
+
+# =========================
+#         SENDER UI
+# =========================
+
+@dataclass
+class QueueItem:
+    path: str
+    size: int
+    status: str = "Pendente"   # Pendente | Enviando | Concluído | Cancelado | Erro
+    sent_bytes: int = 0
+    rate_mbps: float = 0.0
+    eta_str: str = "--"
+
+class SendQueueManager:
+    """Gerencia a fila de envios e o ciclo de vida do envio corrente."""
+    def __init__(self, on_update: Callable[[], None]):
+        self.items: List[QueueItem] = []
+        self.on_update = on_update
+        self.thread: Optional[threading.Thread] = None
+        self.cancel_flag = threading.Event()
+        self.running = False
+        # Estatísticas do arquivo corrente
         self.total = 0
         self.sent = 0
         self.last_sent = 0
         self.last_time = time.time()
-        self.thread = None
-        self.setup_ui()
+        self.rate_window = deque(maxlen=20)  # ~4s se tick=200ms
+        self.current_target: Optional[QueueItem] = None
+        # Parâmetros dinâmicos
+        self.host = ""
+        self.port = 4433
+        self.token = ""
+        self.chunk_mb = 4.0
+        self.parallel = 4
+
+    def add_file(self, path: str):
+        if not os.path.isfile(path):
+            return
+        size = os.path.getsize(path)
+        self.items.append(QueueItem(path=path, size=size))
+        self.on_update()
+
+    def clear_completed(self):
+        self.items = [it for it in self.items if it.status not in ("Concluído", "Cancelado")]
+        self.on_update()
+
+    def _progress_cb(self, delta: int, total: int):
+        self.sent += delta
+        if self.current_target:
+            self.current_target.sent_bytes = self.sent
+
+    def _run_one(self, item: QueueItem):
+        """Executa um envio de arquivo (bloco síncrono dentro de uma thread)."""
+        self.cancel_flag.clear()
+        self.total = item.size
+        self.sent = 0
+        self.last_sent = 0
+        self.last_time = time.time()
+        self.rate_window.clear()
+
+        def runner():
+            # roda client_send em um loop asyncio isolado
+            cancel_event = asyncio.Event()
+            def watch_cancel():
+                # espelha cancel_flag (threading) no cancel_event (asyncio)
+                while not cancel_event.is_set():
+                    if self.cancel_flag.is_set():
+                        try:
+                            loop.call_soon_threadsafe(cancel_event.set)
+                        except:
+                            break
+                    time.sleep(0.05)
+
+            nonlocal_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(nonlocal_loop)
+            loop = nonlocal_loop
+
+            watcher = threading.Thread(target=watch_cancel, daemon=True)
+            watcher.start()
+
+            try:
+                loop.run_until_complete(
+                    client_send(
+                        self.host, self.port, self.token,
+                        item.path, self.chunk_mb, self.parallel,
+                        on_progress=self._progress_cb,
+                        tls_ca=None, max_retries=3,
+                        cancel_event=cancel_event
+                    )
+                )
+            finally:
+                try:
+                    loop.stop()
+                except:
+                    pass
+                try:
+                    loop.close()
+                except:
+                    pass
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        # Espera terminar (ou cancelar)
+        while t.is_alive():
+            if self.cancel_flag.is_set():
+                break
+            time.sleep(0.1)
+        t.join(timeout=0.1)
+
+    def start(self, host: str, port: int, token: str, chunk_mb: float, parallel: int):
+        if self.running:
+            return
+        self.host, self.port, self.token = host, int(port), token
+        self.chunk_mb, self.parallel = float(chunk_mb), int(parallel)
+        self.running = True
+
+        def main_loop():
+            try:
+                for item in self.items:
+                    if item.status in ("Concluído", "Enviando"):
+                        continue
+                    item.status = "Enviando"
+                    self.current_target = item
+                    self.on_update()
+                    try:
+                        self._run_one(item)
+                        if self.cancel_flag.is_set():
+                            item.status = "Cancelado"
+                        else:
+                            item.status = "Concluído"
+                    except Exception:
+                        item.status = "Erro"
+                    finally:
+                        self.current_target = None
+                        self.on_update()
+                    if self.cancel_flag.is_set():
+                        break
+            finally:
+                self.running = False
+                self.cancel_flag.clear()
+                self.on_update()
+
+        self.thread = threading.Thread(target=main_loop, daemon=True)
+        self.thread.start()
+
+    def cancel_current(self):
+        if self.running:
+            self.cancel_flag.set()
+
+    # ======= estatística/ETA ========
+    def tick_stats(self) -> Tuple[float, str]:
+        """Atualiza taxa média móvel e ETA do item corrente; retorna (mbps, eta_str)."""
+        if not self.current_target or self.total <= 0:
+            return 0.0, "--"
+        now = time.time()
+        dt = now - self.last_time
+        if dt <= 0:
+            return self.current_target.rate_mbps, self.current_target.eta_str
+
+        delta = self.sent - self.last_sent
+        inst_rate = (delta / dt) / (1024 * 1024)  # MB/s
+        self.rate_window.append(inst_rate)
+        avg_rate = sum(self.rate_window) / max(1, len(self.rate_window))  # MB/s
+        self.last_sent = self.sent
+        self.last_time = now
+
+        restante = max(0, self.total - self.sent)
+        if avg_rate > 0:
+            eta_sec = restante / (avg_rate * 1024 * 1024)  # segundos
+            m, s = int(eta_sec // 60), int(eta_sec % 60)
+            eta_str = f"{m}m {s}s"
+        else:
+            eta_str = "--"
+
+        self.current_target.rate_mbps = avg_rate
+        self.current_target.eta_str = eta_str
+        return avg_rate, eta_str
+
+class SenderTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.queue_mgr = SendQueueManager(on_update=self.refresh_table)
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
+        self.setup_ui()
 
+    # ---------- UI ----------
     def setup_ui(self):
         lay = QVBoxLayout()
+
         grid = QGridLayout()
         grid.addWidget(QLabel("Código de conexão"), 0, 0)
         self.ed_code = QLineEdit()
-        grid.addWidget(self.ed_code, 0, 1, 1, 2)
-        grid.addWidget(QLabel("Arquivo"), 1, 0)
-        self.ed_file = QLineEdit()
-        self.bt_browse = QPushButton("Escolher")
-        self.bt_browse.clicked.connect(self.pick_file)
-        grid.addWidget(self.ed_file, 1, 1)
-        grid.addWidget(self.bt_browse, 1, 2)
-        grid.addWidget(QLabel("Chunk (MB)"), 2, 0)
+        grid.addWidget(self.ed_code, 0, 1, 1, 3)
+
+        grid.addWidget(QLabel("Chunk (MB)"), 1, 0)
         self.ed_chunk = QDoubleSpinBox()
         self.ed_chunk.setDecimals(1)
         self.ed_chunk.setRange(0.5, 64.0)
         self.ed_chunk.setValue(4.0)
-        grid.addWidget(self.ed_chunk, 2, 1, 1, 2)
-        grid.addWidget(QLabel("Paralelo"), 3, 0)
+        grid.addWidget(self.ed_chunk, 1, 1)
+
+        grid.addWidget(QLabel("Paralelo"), 1, 2)
         self.ed_par = QSpinBox()
         self.ed_par.setRange(1, 16)
         self.ed_par.setValue(4)
-        grid.addWidget(self.ed_par, 3, 1, 1, 2)
-        self.bt_send = QPushButton("Enviar")
-        self.bt_send.clicked.connect(self.start_send)
+        grid.addWidget(self.ed_par, 1, 3)
+
+        # controles da fila
+        hl = QHBoxLayout()
+        self.bt_add = QPushButton("Adicionar arquivo")
+        self.bt_add.clicked.connect(self.pick_file)
+        self.bt_start = QPushButton("Iniciar fila")
+        self.bt_start.clicked.connect(self.start_queue)
+        self.bt_cancel = QPushButton("Cancelar atual")
+        self.bt_cancel.clicked.connect(self.cancel_current)
+        self.bt_clear = QPushButton("Limpar concluídos")
+        self.bt_clear.clicked.connect(self.clear_completed)
+
+        hl.addWidget(self.bt_add)
+        hl.addWidget(self.bt_start)
+        hl.addWidget(self.bt_cancel)
+        hl.addWidget(self.bt_clear)
+
+        # tabela da fila
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Arquivo", "Tamanho", "Status", "Progresso", "Velocidade", "ETA"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        # barra de progresso e labels
         self.pb = QProgressBar()
         self.pb.setRange(0, 1000)
-        self.lb_rate = QLabel("0 MB/s")
+        self.lb_rate = QLabel("0.00 MB/s (média)")
+        self.lb_eta = QLabel("Restante: --")
+
         lay.addLayout(grid)
-        lay.addWidget(self.bt_send)
+        lay.addLayout(hl)
+        lay.addWidget(self.table)
         lay.addWidget(self.pb)
-        lay.addWidget(self.lb_rate, alignment=Qt.AlignmentFlag.AlignRight)
+        hl2 = QHBoxLayout()
+        hl2.addWidget(self.lb_rate)
+        hl2.addStretch(1)
+        hl2.addWidget(self.lb_eta)
+        lay.addLayout(hl2)
         self.setLayout(lay)
 
-    def pick_file(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Escolher arquivo", "", "Todos (*.*)")
-        if f:
-            self.ed_file.setText(f)
+        # drag & drop simples (arrastar arquivos)
+        self.setAcceptDrops(True)
 
+    # drag & drop handlers
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        md: QMimeData = event.mimeData()
+        for url in md.urls():
+            path = url.toLocalFile()
+            if path and os.path.isfile(path):
+                self.queue_mgr.add_file(path)
+        self.refresh_table()
+
+    def pick_file(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Escolher arquivo(s)", "", "Todos (*.*)")
+        for f in files:
+            self.queue_mgr.add_file(f)
+        self.refresh_table()
+
+    # código p2p://host:port#token
     def parse_code(self, code):
         c = code.strip()
         if c.startswith("p2p://"):
@@ -359,55 +676,66 @@ class SenderTab(QWidget):
             return None
         return host.strip(), int(port), token.strip()
 
-    def start_send(self):
+    def start_queue(self):
         parsed = self.parse_code(self.ed_code.text())
         if not parsed:
             QMessageBox.warning(self, "Erro", "Código de conexão inválido")
             return
         host, port, token = parsed
-        file_path = self.ed_file.text().strip()
-        if not os.path.isfile(file_path):
-            QMessageBox.warning(self, "Erro", "Arquivo inválido")
+        if not self.queue_mgr.items:
+            QMessageBox.information(self, "Fila vazia", "Adicione arquivos antes de iniciar.")
             return
-        self.total = os.path.getsize(file_path)
-        self.sent = 0
-        self.last_sent = 0
-        self.last_time = time.time()
-        self.bt_send.setEnabled(False)
-        chunk_mb = float(self.ed_chunk.value())
-        parallel = int(self.ed_par.value())
-        self.thread = threading.Thread(target=self.run_send, args=(host, port, token, file_path, chunk_mb, parallel))
-        self.thread.daemon = True
-        self.thread.start()
-        self.timer.start(200)
+        self.queue_mgr.start(host, port, token, float(self.ed_chunk.value()), int(self.ed_par.value()))
+        self.timer.start(200)  # atualização periódica
 
-    def run_send(self, host, port, token, file_path, chunk_mb, parallel):
-        def on_prog(delta, total):
-            self.sent += delta
-        asyncio.run(client_send(host, port, token, file_path, chunk_mb, parallel, on_prog, None, 3))
+    def cancel_current(self):
+        self.queue_mgr.cancel_current()
+
+    def clear_completed(self):
+        self.queue_mgr.clear_completed()
+
+    # ---------- atualizações de UI ----------
+    def refresh_table(self):
+        self.table.setRowCount(len(self.queue_mgr.items))
+        for i, it in enumerate(self.queue_mgr.items):
+            name = os.path.basename(it.path)
+            size_mb = f"{it.size / (1024*1024):.2f} MB"
+            prog = f"{(it.sent_bytes / it.size * 100.0) if it.size else 0.0:.1f}%"
+            rate = f"{it.rate_mbps:.2f} MB/s"
+            eta = it.eta_str
+
+            self.table.setItem(i, 0, QTableWidgetItem(name))
+            self.table.setItem(i, 1, QTableWidgetItem(size_mb))
+            self.table.setItem(i, 2, QTableWidgetItem(it.status))
+            self.table.setItem(i, 3, QTableWidgetItem(prog))
+            self.table.setItem(i, 4, QTableWidgetItem(rate))
+            self.table.setItem(i, 5, QTableWidgetItem(eta))
 
     def tick(self):
-        if self.total > 0:
-            pct = int(self.sent / self.total * 1000)
-            if pct > 1000:
-                pct = 1000
-            self.pb.setValue(pct)
-            now = time.time()
-            dt = now - self.last_time
-            if dt > 0:
-                rate = (self.sent - self.last_sent) / dt / (1024*1024)
-                self.lb_rate.setText(f"{rate:.2f} MB/s")
-                self.last_sent = self.sent
-                self.last_time = now
-        if self.thread and not self.thread.is_alive():
-            self.bt_send.setEnabled(True)
-            self.timer.stop()
+        # atualiza progresso do atual
+        ct = self.queue_mgr.current_target
+        if ct and ct.size > 0:
+            pct = int(ct.sent_bytes / ct.size * 1000)
+            self.pb.setValue(min(pct, 1000))
+            avg_rate, eta_str = self.queue_mgr.tick_stats()
+            self.lb_rate.setText(f"{avg_rate:.2f} MB/s (média)")
+            self.lb_eta.setText(f"Restante: {eta_str}")
+        else:
+            if not self.queue_mgr.running:
+                self.pb.setValue(0)
+                self.lb_rate.setText("0.00 MB/s (média)")
+                self.lb_eta.setText("Restante: --")
+                self.timer.stop()
+        self.refresh_table()
+
+# =========================
+#        RECEIVER UI
+# =========================
 
 class ReceiverTab(QWidget):
     def __init__(self):
         super().__init__()
-        self.thread = None
-        self.events = asyncio.Queue()
+        self.thread: Optional[_ServerThreadWrapper] = None
         self.rows = {}
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
@@ -431,6 +759,7 @@ class ReceiverTab(QWidget):
         self.bt_out.clicked.connect(self.pick_out)
         grid.addWidget(self.ed_out, 2, 1)
         grid.addWidget(self.bt_out, 2, 2)
+
         hl = QHBoxLayout()
         self.bt_start = QPushButton("Iniciar")
         self.bt_stop = QPushButton("Parar")
@@ -439,6 +768,7 @@ class ReceiverTab(QWidget):
         self.bt_stop.clicked.connect(self.stop_server)
         hl.addWidget(self.bt_start)
         hl.addWidget(self.bt_stop)
+
         self.gb_code = QGroupBox("Código de conexão")
         v2 = QVBoxLayout()
         self.lb_code = QLabel("-")
@@ -449,11 +779,14 @@ class ReceiverTab(QWidget):
         self.lb_qr = QLabel()
         v2.addWidget(self.lb_qr, alignment=Qt.AlignmentFlag.AlignLeft)
         self.gb_code.setLayout(v2)
+
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Sessão","Arquivo","Recebidos","Total","%"])
+        self.table.setHorizontalHeaderLabels(["Sessão", "Arquivo", "Recebidos", "Total", "%"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+
         lay.addLayout(grid)
         lay.addLayout(hl)
         lay.addWidget(self.gb_code)
@@ -494,7 +827,7 @@ class ReceiverTab(QWidget):
             QMessageBox.warning(self, "Erro", "Informe o token")
             return
         os.makedirs(out_dir, exist_ok=True)
-        q = threading.Queue()
+        q = queue.Queue()
         self.thread = _ServerThreadWrapper("0.0.0.0", port, out_dir, token, q)
         self.thread.start()
         self.bt_start.setEnabled(False)
@@ -526,7 +859,9 @@ class ReceiverTab(QWidget):
         while True:
             try:
                 typ, ev, data = self.thread.q.get_nowait()
-            except:
+            except queue.Empty:
+                break
+            except Exception:
                 break
             if typ != "event":
                 continue
@@ -566,42 +901,27 @@ class ReceiverTab(QWidget):
                 row = self.thread.rows.get(sess)
                 if row is not None:
                     self.table.setItem(row, 4, QTableWidgetItem("100.0"))
-                self.append_log(f"Sessão {sess} finalizada")
+                # hashing final opcional no receptor (apenas logar quando terminar)
+                try:
+                    file_name = self.table.item(row, 1).text() if row is not None else None
+                    if file_name:
+                        out_path = os.path.join(self.ed_out.text().strip(), file_name)
+                        if os.path.exists(out_path):
+                            h = sha256_file(out_path)
+                            self.append_log(f"Sessão {sess} finalizada | SHA256={h}")
+                        else:
+                            self.append_log(f"Sessão {sess} finalizada")
+                    else:
+                        self.append_log(f"Sessão {sess} finalizada")
+                except Exception:
+                    self.append_log(f"Sessão {sess} finalizada")
 
-class _ServerThreadWrapper(threading.Thread):
-    def __init__(self, bind, port, out_dir, token, q):
-        super().__init__(daemon=True)
-        self.bind = bind
-        self.port = port
-        self.out_dir = out_dir
-        self.token = token
-        self.q = q
-        self.loop = None
-        self.stop_evt = None
-        self.rows = {}
-        self.table_rows = 0
-
-    def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        def on_event(typ, data):
-            self.q.put(("event", typ, data))
-        srv = ServerCore(self.out_dir, self.token, None, on_event)
-        self.stop_evt = asyncio.Event()
-        try:
-            self.loop.run_until_complete(run_server(self.bind, self.port, srv, self.stop_evt))
-        finally:
-            pass
-
-    def stop(self):
-        if self.loop and self.stop_evt:
-            self.loop.call_soon_threadsafe(self.stop_evt.set)
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Transfer P2P")
-        self.resize(860, 640)
+        self.resize(960, 720)
         tabs = QTabWidget()
         tabs.addTab(SenderTab(), "ENVIAR")
         tabs.addTab(ReceiverTab(), "RECEBER")
