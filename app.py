@@ -24,7 +24,7 @@ import secrets
 import socket
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Callable, Dict, List, Tuple
 
 from PyQt6.QtWidgets import (
@@ -42,18 +42,19 @@ except:
 
 HEADER_LEN_SIZE = 8
 
-def pack_header(d):
+def pack_header(d: dict) -> bytes:
     b = json.dumps(d).encode("utf-8")
     return struct.pack("!Q", len(b)) + b
 
-async def read_exact(reader, n):
-    return await reader.readexactly(n)
+# ==== PATCH: read with timeout (evita sockets zumbis) ====
+async def read_exact(reader: asyncio.StreamReader, n: int, timeout: float = 15.0) -> bytes:
+    return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
 
-async def read_header(reader):
-    l = struct.unpack("!Q", await read_exact(reader, HEADER_LEN_SIZE))[0]
-    return json.loads((await read_exact(reader, l)).decode("utf-8"))
+async def read_header(reader: asyncio.StreamReader, timeout: float = 15.0) -> dict:
+    l = struct.unpack("!Q", await read_exact(reader, HEADER_LEN_SIZE, timeout))[0]
+    return json.loads((await read_exact(reader, l, timeout)).decode("utf-8"))
 
-async def send_msg(writer, header, payload=b""):
+async def send_msg(writer: asyncio.StreamWriter, header: dict, payload: bytes = b"") -> None:
     writer.write(pack_header(header))
     if payload:
         writer.write(payload)
@@ -71,10 +72,10 @@ def sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def ceildiv(a, b):
+def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
-def local_ip():
+def local_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -90,7 +91,7 @@ def local_ip():
 # =========================
 
 class TransferState:
-    def __init__(self, path, file_size, chunk_size):
+    def __init__(self, path: str, file_size: int, chunk_size: int):
         self.path = path
         self.file_size = file_size
         self.chunk_size = chunk_size
@@ -103,7 +104,7 @@ class TransferState:
         self.done = asyncio.Event()
         self.seen = set()
 
-    async def write_chunk(self, index, data):
+    async def write_chunk(self, index: int, data: bytes):
         async with self.lock:
             if index in self.seen:
                 return
@@ -123,7 +124,7 @@ class TransferState:
             pass
 
 class ServerCore:
-    def __init__(self, out_dir, token, ssl_ctx=None, on_event=None):
+    def __init__(self, out_dir: str, token: str, ssl_ctx=None, on_event: Optional[Callable[[str, dict], None]] = None):
         self.out_dir = out_dir
         self.token = token
         self.ssl_ctx = ssl_ctx
@@ -131,14 +132,14 @@ class ServerCore:
         self.sessions_lock = asyncio.Lock()
         self.on_event = on_event
 
-    def emit(self, typ, data):
+    def emit(self, typ: str, data: dict):
         if self.on_event:
             try:
                 self.on_event(typ, data)
             except:
                 pass
 
-    async def handle(self, reader, writer):
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             auth = await read_header(reader)
             if auth.get("type") != "auth" or auth.get("token") != self.token:
@@ -216,7 +217,7 @@ class ServerCore:
             except:
                 pass
 
-async def run_server(bind, port, server_inst, stop_event=None):
+async def run_server(bind: str, port: int, server_inst: ServerCore, stop_event: Optional[asyncio.Event] = None):
     srv = await asyncio.start_server(server_inst.handle, bind, port, ssl=server_inst.ssl_ctx)
     server_inst.emit("listening", {"bind": bind, "port": port})
     async with srv:
@@ -231,68 +232,135 @@ async def run_server(bind, port, server_inst, stop_event=None):
 #        CLIENT CORE
 # =========================
 
+# ==== PATCH: worker resiliente ao WinError 64 no handshake ====
 async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, max_retries,
                         on_progress: Optional[Callable[[int, int], None]],
                         ssl_ctx=None, cancel_event: Optional[asyncio.Event] = None):
-    r, w = await asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None)
-    await send_msg(w, {"type": "auth", "token": token})
-    await send_msg(w, {"type": "manifest", **manifest})
-    await read_header(r)
-    f = open(manifest["filepath"], "rb")
+    """
+    Worker resiliente: reconecta se a conexão cair ANTES/DEPOIS do handshake e continua de onde parou.
+    """
+
+    async def open_stream():
+        await asyncio.sleep(0.05)  # suaviza tempestade de reconexões paralelas
+        return await asyncio.open_connection(
+            host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
+        )
+
+    reader = writer = None
+    BACKOFFS = [0.2, 0.4, 0.8, 1.2, 2.0]  # s
+
     try:
         while True:
             if cancel_event and cancel_event.is_set():
                 break
+
+            # pega o próximo chunk
             try:
                 idx = q.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            f.seek(idx * manifest["chunksize"])
-            data = f.read(manifest["chunksize"])
-            hashexp = sha256_bytes(data)
-            await send_msg(w, {
-                "type": "chunk", "session": manifest["session"], "index": idx,
-                "size": len(data), "sha256": hashexp
-            }, data)
+
+            # garante handshake ok
+            alive = False
+            for attempt in range(1, len(BACKOFFS) + 2):
+                if cancel_event and cancel_event.is_set():
+                    break
+                try:
+                    if reader is None or writer is None or writer.is_closing():
+                        reader, writer = await open_stream()
+                    await send_msg(writer, {"type": "auth", "token": token})
+                    await send_msg(writer, {"type": "manifest", **manifest})
+                    _ = await read_header(reader)  # espera "ready"
+                    alive = True
+                    break
+                except (asyncio.IncompleteReadError, ConnectionResetError, OSError, asyncio.TimeoutError):
+                    # fecha e tenta de novo com backoff
+                    try:
+                        if writer:
+                            writer.close()
+                            await writer.wait_closed()
+                    except:
+                        pass
+                    reader = writer = None
+                    backoff = BACKOFFS[min(attempt - 1, len(BACKOFFS) - 1)]
+                    await asyncio.sleep(backoff)
+
+            if not alive:
+                # não deu handshake — re-enfileira com limite
+                retries[idx] = retries.get(idx, 0) + 1
+                if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
+                    await q.put(idx)
+                continue
+
+            # envia o chunk
             try:
-                ack = await read_header(r)
-            except asyncio.IncompleteReadError:
+                with open(manifest["filepath"], "rb") as f:
+                    f.seek(idx * manifest["chunksize"])
+                    data = f.read(manifest["chunksize"])
+                hashexp = sha256_bytes(data)
+                await send_msg(writer, {
+                    "type": "chunk", "session": manifest["session"], "index": idx,
+                    "size": len(data), "sha256": hashexp
+                }, data)
+
+                # espera ack/nack
+                try:
+                    ack = await read_header(reader, timeout=20.0)
+                except (asyncio.IncompleteReadError, ConnectionResetError, OSError, asyncio.TimeoutError):
+                    retries[idx] = retries.get(idx, 0) + 1
+                    if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
+                        await q.put(idx)
+                    try:
+                        if writer:
+                            writer.close()
+                            await writer.wait_closed()
+                    except:
+                        pass
+                    reader = writer = None
+                    continue
+
+                if ack.get("type") == "ack" and ack.get("index") == idx:
+                    if on_progress:
+                        on_progress(len(data), manifest["filesize"])
+                    continue
+
+                # nack ou inesperado
                 retries[idx] = retries.get(idx, 0) + 1
                 if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
                     await q.put(idx)
-                continue
 
-            if ack.get("type") == "ack" and ack.get("index") == idx:
-                if on_progress:
-                    on_progress(len(data), manifest["filesize"])
-                continue
-
-            if ack.get("type") == "nack" and ack.get("index") == idx:
+            except Exception:
                 retries[idx] = retries.get(idx, 0) + 1
                 if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
                     await q.put(idx)
-                continue
+                try:
+                    if writer:
+                        writer.close()
+                        await writer.wait_closed()
+                except:
+                    pass
+                reader = writer = None
 
-            # outro caso: re-enfileira com limite
-            retries[idx] = retries.get(idx, 0) + 1
-            if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
-                await q.put(idx)
-
-        # Finalização
+        # finalização educada
         if not (cancel_event and cancel_event.is_set()):
-            await send_msg(w, {"type": "done"})
             try:
-                await read_header(r)
-            except asyncio.IncompleteReadError:
+                if reader is None or writer is None or writer.is_closing():
+                    reader, writer = await open_stream()
+                    await send_msg(writer, {"type": "auth", "token": token})
+                    await send_msg(writer, {"type": "manifest", **manifest})
+                    _ = await read_header(reader)
+                await send_msg(writer, {"type": "done"})
+                try:
+                    _ = await read_header(reader)
+                except Exception:
+                    pass
+            except Exception:
                 pass
     finally:
         try:
-            f.close()
-        except:
-            pass
-        try:
-            w.close()
-            await w.wait_closed()
+            if writer:
+                writer.close()
+                await writer.wait_closed()
         except:
             pass
 
@@ -448,6 +516,7 @@ class SendQueueManager:
         def runner():
             # roda client_send em um loop asyncio isolado
             cancel_event = asyncio.Event()
+
             def watch_cancel():
                 # espelha cancel_flag (threading) no cancel_event (asyncio)
                 while not cancel_event.is_set():
@@ -842,7 +911,7 @@ class ReceiverTab(QWidget):
         self.bt_stop.setEnabled(False)
         self.append_log("Encerrando servidor...")
 
-    def append_log(self, txt):
+    def append_log(self, txt: str):
         self.log.appendPlainText(txt)
 
     def copy_code(self):
