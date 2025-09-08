@@ -1,13 +1,3 @@
-# app.py — Transfer P2P (refactor com fila, cancelamento, ETA e UX melhorada)
-# Requisitos: Python 3.10+, PyQt6
-# Observações:
-# - Protocolo mantido (auth -> manifest -> chunk/ack -> done/finished).
-# - Fila de envios com UI (adicionar vários arquivos; iniciar; cancelar atual; limpar concluídos).
-# - ETA (tempo restante) + taxa média com janela móvel.
-# - Cancelamento imediato via asyncio.Event.
-# - Logs visíveis e estáveis; mensagens de sessão no receptor.
-# - Correção: uso de queue.Queue para comunicação entre threads.
-# - Opcional: hashing final do arquivo no receptor ao concluir (mostrado no log).
 
 import os
 import sys
