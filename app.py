@@ -1,8 +1,8 @@
-
 import os
 import sys
 import ssl
 import io
+import csv
 import json
 import time
 import asyncio
@@ -10,9 +10,10 @@ import hashlib
 import struct
 import uuid
 import queue
-import secrets
 import socket
 import threading
+import pathlib
+import re as _re
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict, List, Tuple
@@ -27,10 +28,15 @@ from PyQt6.QtGui import QPixmap
 
 try:
     import qrcode
-except:
+except Exception:
     qrcode = None
 
 HEADER_LEN_SIZE = 8
+CSV_PATH = os.path.abspath("./codigo_conexao.csv")
+
+# =========================
+#        HELPERS
+# =========================
 
 def pack_header(d: dict) -> bytes:
     b = json.dumps(d).encode("utf-8")
@@ -70,69 +76,136 @@ def local_ip() -> str:
     try:
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
-    except:
+    except Exception:
         ip = socket.gethostbyname(socket.gethostname())
     finally:
         s.close()
     return ip
+
+# ---- filename seguro
+SAFE_FILENAME_RE = _re.compile(r"[^A-Za-z0-9 ._\-]")
+
+def safe_filename(name: str) -> str:
+    clean = pathlib.Path(name).name
+    clean = SAFE_FILENAME_RE.sub("", clean)
+    return clean or "arquivo"
+
+# ---- CSV para persistir o código fixo
+def save_code_csv(code: str, csv_path: str = CSV_PATH):
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["codigo"])
+            w.writerow([code])
+    except Exception:
+        pass
+
+def load_code_csv(csv_path: str = CSV_PATH) -> Optional[str]:
+    try:
+        if not os.path.exists(csv_path):
+            return None
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            r = csv.reader(f)
+            header = next(r, None)
+            row = next(r, None)
+            if row and row[0].strip():
+                return row[0].strip()
+    except Exception:
+        pass
+    return None
 
 # =========================
 #        SERVER CORE
 # =========================
 
 class TransferState:
-    def __init__(self, path: str, file_size: int, chunk_size: int):
-        self.path = path
-        self.file_size = file_size
-        self.chunk_size = chunk_size
-        self.total_chunks = ceildiv(file_size, chunk_size)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self.fh = open(path, "wb+")
-        self.fh.truncate(file_size)
+    """Escreve em arquivo temporário .part, valida e renomeia no fim."""
+    def __init__(self, final_path: str, file_size: int, chunk_size: int):
+        self.final_path = final_path
+        self.tmp_path = final_path + ".part"
+        self.file_size = int(file_size)
+        self.chunk_size = int(chunk_size)
+        self.total_chunks = ceildiv(self.file_size, self.chunk_size)
+
+        os.makedirs(os.path.dirname(self.final_path) or ".", exist_ok=True)
+        self.fh = open(self.tmp_path, "wb+")
+        self.fh.truncate(self.file_size)
+
         self.received = 0
         self.lock = asyncio.Lock()
         self.done = asyncio.Event()
         self.seen = set()
 
+        # fsync em lote
+        self._since_fsync = 0
+        self._fsync_every = 64
+
     async def write_chunk(self, index: int, data: bytes):
+        # valida índice/tamanho
+        if index < 0 or index >= self.total_chunks:
+            return
+        if index != self.total_chunks - 1:
+            if len(data) != self.chunk_size:
+                return
+        else:
+            max_last = self.file_size - (index * self.chunk_size)
+            if len(data) > max_last:
+                return
+
         async with self.lock:
             if index in self.seen:
                 return
             self.fh.seek(index * self.chunk_size)
             self.fh.write(data)
-            self.fh.flush()
-            os.fsync(self.fh.fileno())
             self.seen.add(index)
             self.received += 1
+
+            self._since_fsync += 1
+            if self._since_fsync >= self._fsync_every or self.received >= self.total_chunks:
+                self.fh.flush()
+                os.fsync(self.fh.fileno())
+                self._since_fsync = 0
+
             if self.received >= self.total_chunks:
                 self.done.set()
 
-    def close(self):
+    def flush_close(self):
+        try:
+            self.fh.flush()
+            os.fsync(self.fh.fileno())
+        except Exception:
+            pass
         try:
             self.fh.close()
-        except:
+        except Exception:
             pass
 
 class ServerCore:
-    def __init__(self, out_dir: str, token: str, ssl_ctx=None, on_event: Optional[Callable[[str, dict], None]] = None):
+    """
+    Usa 'expected_code' (código fixo definido pelo usuário) para autenticação.
+    Garante integridade com SHA-256 final antes de renomear .part -> final.
+    """
+    def __init__(self, out_dir: str, expected_code: str, ssl_ctx=None, on_event: Optional[Callable[[str, dict], None]] = None):
         self.out_dir = out_dir
-        self.token = token
+        self.expected_code = (expected_code or "").strip()
         self.ssl_ctx = ssl_ctx
         self.sessions: Dict[str, TransferState] = {}
         self.sessions_lock = asyncio.Lock()
         self.on_event = on_event
+        self.meta: Dict[str, dict] = {}
 
     def emit(self, typ: str, data: dict):
         if self.on_event:
             try:
                 self.on_event(typ, data)
-            except:
+            except Exception:
                 pass
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
             auth = await read_header(reader)
-            if auth.get("type") != "auth" or auth.get("token") != self.token:
+            # autenticação simples por código fixo
+            if auth.get("type") != "auth" or (self.expected_code and auth.get("code") != self.expected_code):
                 await send_msg(writer, {"type": "error", "reason": "auth"})
                 writer.close()
                 await writer.wait_closed()
@@ -146,16 +219,30 @@ class ServerCore:
                 return
 
             sess = manifest["session"]
-            name = manifest["filename"]
-            fsize = manifest["filesize"]
-            csize = manifest["chunksize"]
+            name = safe_filename(manifest["filename"])
+            fsize = int(manifest["filesize"])
+            csize = int(manifest["chunksize"])
+            filehash = manifest.get("filehash")
+
+            # valida manifesto
+            if fsize <= 0 or csize < 512 * 1024 or csize > 64 * 1024 * 1024:
+                await send_msg(writer, {"type": "error", "reason": "bad_manifest"})
+                writer.close()
+                await writer.wait_closed()
+                return
 
             async with self.sessions_lock:
                 st = self.sessions.get(sess)
                 if not st:
-                    path = os.path.join(self.out_dir, name)
-                    st = TransferState(path, fsize, csize)
+                    final_path = os.path.join(self.out_dir, name)
+                    st = TransferState(final_path, fsize, csize)
                     self.sessions[sess] = st
+                    self.meta[sess] = {
+                        "filename": name,
+                        "filesize": fsize,
+                        "chunksize": csize,
+                        "filehash": filehash,
+                    }
                     self.emit("session", {"session": sess, "filename": name, "total": st.total_chunks})
 
             await send_msg(writer, {"type": "ready", "session": sess, "chunks": st.total_chunks})
@@ -163,13 +250,14 @@ class ServerCore:
             while True:
                 h = await read_header(reader)
                 t = h.get("type")
+
                 if t == "chunk":
-                    sess2 = h["session"]
+                    sess2 = h.get("session")
                     if sess2 != sess:
                         await send_msg(writer, {"type": "error", "reason": "session"})
                         break
-                    idx = h["index"]
-                    size = h["size"]
+                    idx = int(h["index"])
+                    size = int(h["size"])
                     hashexp = h["sha256"]
                     data = await read_exact(reader, size)
                     if sha256_bytes(data) != hashexp:
@@ -180,17 +268,53 @@ class ServerCore:
                     self.emit("progress", {"session": sess, "received": st.received, "total": st.total_chunks})
 
                 elif t == "done":
-                    if st.done.is_set():
+                    meta = self.meta.get(sess, {})
+                    expected = meta.get("filehash")
+                    st.flush_close()
+                    calc = sha256_file(st.tmp_path)
+                    if expected and calc != expected:
+                        try:
+                            os.remove(st.tmp_path)
+                        except Exception:
+                            pass
+                        await send_msg(writer, {"type": "error", "reason": "hash_mismatch"})
+                    else:
+                        try:
+                            os.replace(st.tmp_path, st.final_path)
+                        except Exception:
+                            os.rename(st.tmp_path, st.final_path)
                         await send_msg(writer, {"type": "finished", "session": sess})
                         self.emit("finished", {"session": sess})
-                    else:
-                        await send_msg(writer, {"type": "pending", "left": st.total_chunks - st.received})
+                    async with self.sessions_lock:
+                        self.sessions.pop(sess, None)
+                        self.meta.pop(sess, None)
+                    break
+
                 else:
                     await send_msg(writer, {"type": "error", "reason": "type"})
 
-                if st.done.is_set():
-                    await send_msg(writer, {"type": "finished", "session": sess})
-                    self.emit("finished", {"session": sess})
+                if self.sessions.get(sess, None) and self.sessions[sess].done.is_set():
+                    # cliente pode não mandar 'done'; finalize mesmo assim
+                    meta = self.meta.get(sess, {})
+                    expected = meta.get("filehash")
+                    st.flush_close()
+                    calc = sha256_file(st.tmp_path)
+                    if expected and calc != expected:
+                        try:
+                            os.remove(st.tmp_path)
+                        except Exception:
+                            pass
+                        await send_msg(writer, {"type": "error", "reason": "hash_mismatch"})
+                    else:
+                        try:
+                            os.replace(st.tmp_path, st.final_path)
+                        except Exception:
+                            os.rename(st.tmp_path, st.final_path)
+                        await send_msg(writer, {"type": "finished", "session": sess})
+                        self.emit("finished", {"session": sess})
+                    async with self.sessions_lock:
+                        self.sessions.pop(sess, None)
+                        self.meta.pop(sess, None)
                     break
 
         except asyncio.IncompleteReadError:
@@ -198,13 +322,13 @@ class ServerCore:
         except Exception:
             try:
                 await send_msg(writer, {"type": "error", "reason": "exception"})
-            except:
+            except Exception:
                 pass
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except:
+            except Exception:
                 pass
 
 async def run_server(bind: str, port: int, server_inst: ServerCore, stop_event: Optional[asyncio.Event] = None):
@@ -222,12 +346,12 @@ async def run_server(bind: str, port: int, server_inst: ServerCore, stop_event: 
 #        CLIENT CORE
 # =========================
 
-# ==== PATCH: worker resiliente ao WinError 64 no handshake ====
-async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, max_retries,
+# ==== PATCH: worker resiliente ao handshake/queda ====
+async def client_worker(host, port, code, manifest, q: asyncio.Queue, retries, max_retries,
                         on_progress: Optional[Callable[[int, int], None]],
                         ssl_ctx=None, cancel_event: Optional[asyncio.Event] = None):
     """
-    Worker resiliente: reconecta se a conexão cair ANTES/DEPOIS do handshake e continua de onde parou.
+    Worker resiliente: reconecta se a conexão cair antes/depois do handshake e continua de onde parou.
     """
 
     async def open_stream():
@@ -258,25 +382,23 @@ async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, 
                 try:
                     if reader is None or writer is None or writer.is_closing():
                         reader, writer = await open_stream()
-                    await send_msg(writer, {"type": "auth", "token": token})
+                    await send_msg(writer, {"type": "auth", "code": code})
                     await send_msg(writer, {"type": "manifest", **manifest})
                     _ = await read_header(reader)  # espera "ready"
                     alive = True
                     break
                 except (asyncio.IncompleteReadError, ConnectionResetError, OSError, asyncio.TimeoutError):
-                    # fecha e tenta de novo com backoff
                     try:
                         if writer:
                             writer.close()
                             await writer.wait_closed()
-                    except:
+                    except Exception:
                         pass
                     reader = writer = None
                     backoff = BACKOFFS[min(attempt - 1, len(BACKOFFS) - 1)]
                     await asyncio.sleep(backoff)
 
             if not alive:
-                # não deu handshake — re-enfileira com limite
                 retries[idx] = retries.get(idx, 0) + 1
                 if retries[idx] <= max_retries and not (cancel_event and cancel_event.is_set()):
                     await q.put(idx)
@@ -304,7 +426,7 @@ async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, 
                         if writer:
                             writer.close()
                             await writer.wait_closed()
-                    except:
+                    except Exception:
                         pass
                     reader = writer = None
                     continue
@@ -327,7 +449,7 @@ async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, 
                     if writer:
                         writer.close()
                         await writer.wait_closed()
-                except:
+                except Exception:
                     pass
                 reader = writer = None
 
@@ -336,7 +458,7 @@ async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, 
             try:
                 if reader is None or writer is None or writer.is_closing():
                     reader, writer = await open_stream()
-                    await send_msg(writer, {"type": "auth", "token": token})
+                    await send_msg(writer, {"type": "auth", "code": code})
                     await send_msg(writer, {"type": "manifest", **manifest})
                     _ = await read_header(reader)
                 await send_msg(writer, {"type": "done"})
@@ -351,10 +473,10 @@ async def client_worker(host, port, token, manifest, q: asyncio.Queue, retries, 
             if writer:
                 writer.close()
                 await writer.wait_closed()
-        except:
+        except Exception:
             pass
 
-async def client_send(host, port, token, file_path, chunk_mb, parallel,
+async def client_send(host, port, code, file_path, chunk_mb, parallel,
                       on_progress=None, tls_ca=None, max_retries=3,
                       cancel_event: Optional[asyncio.Event] = None):
     chunk_size = int(float(chunk_mb) * 1024 * 1024)
@@ -362,9 +484,16 @@ async def client_send(host, port, token, file_path, chunk_mb, parallel,
     total_chunks = ceildiv(filesize, chunk_size)
     name = os.path.basename(file_path)
     sess = str(uuid.uuid4())
+    filehash = sha256_file(file_path)
     manifest = {
-        "type": "manifest", "session": sess, "filename": name,
-        "filepath": file_path, "filesize": filesize, "chunksize": chunk_size, "total": total_chunks
+        "type": "manifest",
+        "session": sess,
+        "filename": name,
+        "filepath": file_path,
+        "filesize": filesize,
+        "chunksize": chunk_size,
+        "total": total_chunks,
+        "filehash": filehash,
     }
     q = asyncio.Queue()
     for i in range(total_chunks):
@@ -378,7 +507,7 @@ async def client_send(host, port, token, file_path, chunk_mb, parallel,
     tasks = []
     for _ in range(parallel):
         tasks.append(asyncio.create_task(
-            client_worker(host, port, token, manifest, q, retries, max_retries, on_progress, ssl_ctx, cancel_event)
+            client_worker(host, port, code, manifest, q, retries, max_retries, on_progress, ssl_ctx, cancel_event)
         ))
     await asyncio.gather(*tasks)
 
@@ -387,12 +516,12 @@ async def client_send(host, port, token, file_path, chunk_mb, parallel,
 # =========================
 
 class ServerThread(threading.Thread):
-    def __init__(self, bind, port, out_dir, token, q):
+    def __init__(self, bind, port, out_dir, code, q):
         super().__init__(daemon=True)
         self.bind = bind
         self.port = port
         self.out_dir = out_dir
-        self.token = token
+        self.code = code
         self.q: queue.Queue = q
         self.loop = None
         self.stop_evt = None
@@ -402,7 +531,7 @@ class ServerThread(threading.Thread):
         asyncio.set_event_loop(self.loop)
         def on_event(typ, data):
             self.q.put(("event", typ, data))
-        srv = ServerCore(self.out_dir, self.token, None, on_event)
+        srv = ServerCore(self.out_dir, self.code, None, on_event)
         self.stop_evt = asyncio.Event()
         try:
             self.loop.run_until_complete(run_server(self.bind, self.port, srv, self.stop_evt))
@@ -413,35 +542,9 @@ class ServerThread(threading.Thread):
         if self.loop and self.stop_evt:
             self.loop.call_soon_threadsafe(self.stop_evt.set)
 
-class _ServerThreadWrapper(threading.Thread):
-    """Mantido para compatibilidade com ReceiverTab; idêntico ao ServerThread mas com controles de UI."""
-    def __init__(self, bind, port, out_dir, token, q):
-        super().__init__(daemon=True)
-        self.bind = bind
-        self.port = port
-        self.out_dir = out_dir
-        self.token = token
-        self.q: queue.Queue = q
-        self.loop = None
-        self.stop_evt = None
-        self.rows = {}
-        self.table_rows = 0
-
-    def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        def on_event(typ, data):
-            self.q.put(("event", typ, data))
-        srv = ServerCore(self.out_dir, self.token, None, on_event)
-        self.stop_evt = asyncio.Event()
-        try:
-            self.loop.run_until_complete(run_server(self.bind, self.port, srv, self.stop_evt))
-        finally:
-            pass
-
-    def stop(self):
-        if self.loop and self.stop_evt:
-            self.loop.call_soon_threadsafe(self.stop_evt.set)
+class _ServerThreadWrapper(ServerThread):
+    """Mesma funcionalidade do ServerThread, mantido para compatibilidade com ReceiverTab."""
+    pass
 
 # =========================
 #         SENDER UI
@@ -474,7 +577,7 @@ class SendQueueManager:
         # Parâmetros dinâmicos
         self.host = ""
         self.port = 4433
-        self.token = ""
+        self.code = ""
         self.chunk_mb = 4.0
         self.parallel = 4
 
@@ -513,7 +616,7 @@ class SendQueueManager:
                     if self.cancel_flag.is_set():
                         try:
                             loop.call_soon_threadsafe(cancel_event.set)
-                        except:
+                        except Exception:
                             break
                     time.sleep(0.05)
 
@@ -527,7 +630,7 @@ class SendQueueManager:
             try:
                 loop.run_until_complete(
                     client_send(
-                        self.host, self.port, self.token,
+                        self.host, self.port, self.code,
                         item.path, self.chunk_mb, self.parallel,
                         on_progress=self._progress_cb,
                         tls_ca=None, max_retries=3,
@@ -537,11 +640,11 @@ class SendQueueManager:
             finally:
                 try:
                     loop.stop()
-                except:
+                except Exception:
                     pass
                 try:
                     loop.close()
-                except:
+                except Exception:
                     pass
 
         t = threading.Thread(target=runner, daemon=True)
@@ -553,10 +656,10 @@ class SendQueueManager:
             time.sleep(0.1)
         t.join(timeout=0.1)
 
-    def start(self, host: str, port: int, token: str, chunk_mb: float, parallel: int):
+    def start(self, host: str, port: int, code: str, chunk_mb: float, parallel: int):
         if self.running:
             return
-        self.host, self.port, self.token = host, int(port), token
+        self.host, self.port, self.code = host, int(port), code
         self.chunk_mb, self.parallel = float(chunk_mb), int(parallel)
         self.running = True
 
@@ -637,6 +740,11 @@ class SenderTab(QWidget):
         grid = QGridLayout()
         grid.addWidget(QLabel("Código de conexão"), 0, 0)
         self.ed_code = QLineEdit()
+        # Tenta pré-carregar apenas o "código" salvo
+        saved = load_code_csv()
+        # Dica de formato: p2p://host:port#codigo
+        placeholder = "p2p://192.168.0.10:4433#SEU-CODIGO"
+        self.ed_code.setPlaceholderText(placeholder)
         grid.addWidget(self.ed_code, 0, 1, 1, 3)
 
         grid.addWidget(QLabel("Chunk (MB)"), 1, 0)
@@ -712,18 +820,18 @@ class SenderTab(QWidget):
             self.queue_mgr.add_file(f)
         self.refresh_table()
 
-    # código p2p://host:port#token
+    # código p2p://host:port#codigo
     def parse_code(self, code):
         c = code.strip()
         if c.startswith("p2p://"):
             c = c[6:]
-        token = None
+        code_fixed = None
         if "#" in c:
-            hostport, token = c.split("#", 1)
+            hostport, code_fixed = c.split("#", 1)
         else:
             parts = c.replace(" ", "#").split("#")
             if len(parts) == 2:
-                hostport, token = parts
+                hostport, code_fixed = parts
             else:
                 hostport = c
         if ":" in hostport:
@@ -731,20 +839,27 @@ class SenderTab(QWidget):
             port = int(port)
         else:
             host, port = hostport, 4433
-        if not token or token.strip() == "":
+        if not code_fixed or code_fixed.strip() == "":
             return None
-        return host.strip(), int(port), token.strip()
+        return host.strip(), int(port), code_fixed.strip()
 
     def start_queue(self):
         parsed = self.parse_code(self.ed_code.text())
         if not parsed:
-            QMessageBox.warning(self, "Erro", "Código de conexão inválido")
+            QMessageBox.warning(self, "Erro", "Código de conexão inválido. Use p2p://host:port#CODIGO")
             return
-        host, port, token = parsed
+        host, port, code = parsed
+
+        # salva o código no CSV (somente o código fixo)
+        try:
+            save_code_csv(code)
+        except Exception:
+            pass
+
         if not self.queue_mgr.items:
             QMessageBox.information(self, "Fila vazia", "Adicione arquivos antes de iniciar.")
             return
-        self.queue_mgr.start(host, port, token, float(self.ed_chunk.value()), int(self.ed_par.value()))
+        self.queue_mgr.start(host, port, code, float(self.ed_chunk.value()), int(self.ed_par.value()))
         self.timer.start(200)  # atualização periódica
 
     def cancel_current(self):
@@ -798,7 +913,7 @@ class ReceiverTab(QWidget):
         self.rows = {}
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
-        self.token = secrets.token_hex(16)
+        self._running = False  # estado do servidor (para toggle)
         self.setup_ui()
 
     def setup_ui(self):
@@ -809,9 +924,15 @@ class ReceiverTab(QWidget):
         self.ed_port.setRange(1, 65535)
         self.ed_port.setValue(4433)
         grid.addWidget(self.ed_port, 0, 1, 1, 2)
-        grid.addWidget(QLabel("Token"), 1, 0)
-        self.ed_token = QLineEdit(self.token)
-        grid.addWidget(self.ed_token, 1, 1, 1, 2)
+
+        grid.addWidget(QLabel("Código (fixo)"), 1, 0)
+        self.ed_code = QLineEdit()
+        # carregar código salvo
+        saved = load_code_csv()
+        if saved:
+            self.ed_code.setText(saved)
+        grid.addWidget(self.ed_code, 1, 1, 1, 2)
+
         grid.addWidget(QLabel("Saída"), 2, 0)
         self.ed_out = QLineEdit(os.path.abspath("./recebidos"))
         self.bt_out = QPushButton("Escolher")
@@ -820,19 +941,15 @@ class ReceiverTab(QWidget):
         grid.addWidget(self.bt_out, 2, 2)
 
         hl = QHBoxLayout()
-        self.bt_start = QPushButton("Iniciar")
-        self.bt_stop = QPushButton("Parar")
-        self.bt_stop.setEnabled(False)
-        self.bt_start.clicked.connect(self.start_server)
-        self.bt_stop.clicked.connect(self.stop_server)
-        hl.addWidget(self.bt_start)
-        hl.addWidget(self.bt_stop)
+        self.bt_toggle = QPushButton("Iniciar")  # único botão INICIAR/PARAR
+        self.bt_toggle.clicked.connect(self.toggle_server)
+        hl.addWidget(self.bt_toggle)
 
-        self.gb_code = QGroupBox("Código de conexão")
+        self.gb_code = QGroupBox("Código de conexão (URL para o remetente)")
         v2 = QVBoxLayout()
-        self.lb_code = QLabel("-")
-        v2.addWidget(self.lb_code)
-        self.bt_copy = QPushButton("Copiar código")
+        self.lb_code_url = QLabel("-")
+        v2.addWidget(self.lb_code_url)
+        self.bt_copy = QPushButton("Copiar código (URL)")
         self.bt_copy.clicked.connect(self.copy_code)
         v2.addWidget(self.bt_copy, alignment=Qt.AlignmentFlag.AlignLeft)
         self.lb_qr = QLabel()
@@ -854,17 +971,17 @@ class ReceiverTab(QWidget):
         lay.addWidget(self.log)
         self.setLayout(lay)
 
-    def build_code(self):
+    def build_code_url(self):
         ip = local_ip()
         port = int(self.ed_port.value())
-        token = self.ed_token.text().strip()
-        return f"p2p://{ip}:{port}#{token}"
+        code = self.ed_code.text().strip()
+        return f"p2p://{ip}:{port}#{"{code}".format(code=code) if code else ''}".rstrip("#")
 
     def update_code_ui(self):
-        code = self.build_code()
-        self.lb_code.setText(code)
-        if qrcode:
-            img = qrcode.make(code)
+        url = self.build_code_url()
+        self.lb_code_url.setText(url or "-")
+        if qrcode and url:
+            img = qrcode.make(url)
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             pix = QPixmap()
@@ -878,43 +995,51 @@ class ReceiverTab(QWidget):
         if d:
             self.ed_out.setText(d)
 
-    def start_server(self):
-        port = int(self.ed_port.value())
-        token = self.ed_token.text().strip()
-        out_dir = self.ed_out.text().strip()
-        if not token:
-            QMessageBox.warning(self, "Erro", "Informe o token")
-            return
-        os.makedirs(out_dir, exist_ok=True)
-        q = queue.Queue()
-        self.thread = _ServerThreadWrapper("0.0.0.0", port, out_dir, token, q)
-        self.thread.start()
-        self.bt_start.setEnabled(False)
-        self.bt_stop.setEnabled(True)
-        self.append_log(f"Servidor iniciado em 0.0.0.0:{port}")
-        self.update_code_ui()
-        self.timer.start(200)
-
-    def stop_server(self):
-        if self.thread:
-            self.thread.stop()
-        self.bt_stop.setEnabled(False)
-        self.append_log("Encerrando servidor...")
+    def toggle_server(self):
+        if not self._running:
+            # Iniciar
+            port = int(self.ed_port.value())
+            code = self.ed_code.text().strip()
+            out_dir = self.ed_out.text().strip()
+            if not code:
+                QMessageBox.warning(self, "Erro", "Informe o código fixo.")
+                return
+            os.makedirs(out_dir, exist_ok=True)
+            # salva código no CSV
+            save_code_csv(code)
+            q = queue.Queue()
+            self.thread = _ServerThreadWrapper("0.0.0.0", port, out_dir, code, q)
+            self.thread.start()
+            self._running = True
+            self.bt_toggle.setText("Parar")
+            self.append_log(f"Servidor iniciado em 0.0.0.0:{port}")
+            self.update_code_ui()
+            self.timer.start(200)
+        else:
+            # Parar
+            if self.thread:
+                self.thread.stop()
+            self.bt_toggle.setEnabled(False)  # desabilita até confirmar parada
+            self.append_log("Encerrando servidor...")
 
     def append_log(self, txt: str):
         self.log.appendPlainText(txt)
 
     def copy_code(self):
-        QApplication.clipboard().setText(self.build_code())
+        QApplication.clipboard().setText(self.build_code_url() or "")
 
     def tick(self):
-        if self.thread and not self.thread.is_alive():
-            self.bt_start.setEnabled(True)
-            self.bt_stop.setEnabled(False)
+        # quando thread realmente parar, faça o toggle voltar
+        if self.thread and not self.thread.is_alive() and self._running:
+            self._running = False
+            self.bt_toggle.setText("Iniciar")
+            self.bt_toggle.setEnabled(True)
             self.timer.stop()
             self.append_log("Servidor parado")
+
         if not self.thread:
             return
+
         while True:
             try:
                 typ, ev, data = self.thread.q.get_nowait()
@@ -930,8 +1055,11 @@ class ReceiverTab(QWidget):
                 sess = data["session"]
                 name = data["filename"]
                 total = data["total"]
-                row = self.thread.rows.get(sess)
+                row = getattr(self.thread, "rows", {}).get(sess) if hasattr(self.thread, "rows") else None
                 if row is None:
+                    if not hasattr(self.thread, "rows"):
+                        self.thread.rows = {}
+                        self.thread.table_rows = 0
                     row = self.thread.table_rows
                     self.thread.table_rows += 1
                     self.table.insertRow(row)
@@ -946,7 +1074,7 @@ class ReceiverTab(QWidget):
                 sess = data["session"]
                 rec = data["received"]
                 tot = data["total"]
-                row = self.thread.rows.get(sess)
+                row = getattr(self.thread, "rows", {}).get(sess) if hasattr(self.thread, "rows") else None
                 if row is None:
                     continue
                 self.table.setItem(row, 2, QTableWidgetItem(str(rec)))
@@ -957,10 +1085,10 @@ class ReceiverTab(QWidget):
                 self.table.setItem(row, 4, QTableWidgetItem(f"{pct:.1f}"))
             elif ev == "finished":
                 sess = data["session"]
-                row = self.thread.rows.get(sess)
+                row = getattr(self.thread, "rows", {}).get(sess) if hasattr(self.thread, "rows") else None
                 if row is not None:
                     self.table.setItem(row, 4, QTableWidgetItem("100.0"))
-                # hashing final opcional no receptor (apenas logar quando terminar)
+                # hashing final no receptor (apenas logar quando terminar)
                 try:
                     file_name = self.table.item(row, 1).text() if row is not None else None
                     if file_name:
@@ -975,6 +1103,9 @@ class ReceiverTab(QWidget):
                 except Exception:
                     self.append_log(f"Sessão {sess} finalizada")
 
+# =========================
+#          MAIN
+# =========================
 
 class MainWindow(QWidget):
     def __init__(self):
